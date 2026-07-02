@@ -1,4 +1,4 @@
-<?jelly escape-by-default='true'?>
+<?jelly escape-by-default='false'?>
 <j:jelly xmlns:j="jelly:core" xmlns:st="jelly:stapler" xmlns:d="jelly:define" xmlns:l="/lib/layout"
          xmlns:t="/lib/hudson" xmlns:f="/lib/form">
     <f:entry field="allowsSignup">
@@ -25,20 +25,31 @@
         <f:checkbox default="true" title="${%Current Realm Priority}"/>
     </f:entry>
     <f:entry title="${%Optional Realm}">
-        <f:repeatable var="optional" items="${descriptor.securityRealmDescriptors}"
-                      header="${%Move out order}" noAddButton="true">
-            <table width="100%">
-                <j:scope>
-                    <j:set var="instance" value="${descriptor.getInstance(optional)}"/>
-                    <j:set var="descriptor" value="${optional}"/>
-                    <f:optionalBlock field="$enabled" title="${optional.displayName}" inline="true" checked="${instance != null}">
-                        <f:invisibleEntry>
-                            <input type="hidden" name="$id" value="${optional.id}"/>
-                        </f:invisibleEntry>
-                        <st:include page="${optional.configPage}" from="${optional}" optional="true"/>
-                    </f:optionalBlock>
-                </j:scope>
-            </table>
-        </f:repeatable>
+        <style>
+            .mixing-realm-block { border: 1px solid #ccc; padding: 10px; margin: 5px 0; }
+            .mixing-realm-config { display: none; margin-top: 10px; padding-left: 20px; }
+            .mixing-realm-checkbox:checked ~ .mixing-realm-config { display: block; }
+        </style>
+        <div>
+            <j:set var="mixingDescriptor" value="${descriptor}"/>
+            <j:forEach var="realmDescriptor" items="${mixingDescriptor.getSecurityRealmDescriptors()}" varStatus="loop">
+                <j:set var="instance" value="${mixingDescriptor.getInstance(realmDescriptor)}"/>
+                <div class="mixing-realm-block">
+                    <j:if test="${instance != null}">
+                        <input type="checkbox" class="mixing-realm-checkbox" name="optionalEnabled${loop.index}" value="on" checked="checked"/>
+                    </j:if>
+                    <j:if test="${instance == null}">
+                        <input type="checkbox" class="mixing-realm-checkbox" name="optionalEnabled${loop.index}" value="on"/>
+                    </j:if>
+                    <strong>${realmDescriptor.displayName}</strong>
+                    <input type="hidden" name="optionalId${loop.index}" value="${realmDescriptor.id}"/>
+                    <div class="mixing-realm-config">
+                        <j:set var="descriptor" value="${realmDescriptor}"/>
+                        <j:set var="instance" value="${instance}"/>
+                        <st:include page="${realmDescriptor.configPage}" from="${realmDescriptor}" optional="true"/>
+                    </div>
+                </div>
+            </j:forEach>
+        </div>
     </f:entry>
 </j:jelly>

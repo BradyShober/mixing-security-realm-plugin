@@ -9,7 +9,6 @@ import hudson.model.UserProperty;
 import hudson.model.UserPropertyDescriptor;
 import hudson.security.SecurityRealm.SecurityComponents;
 import hudson.security.captcha.CaptchaSupport;
-import hudson.util.spring.BeanBuilder;
 import jenkins.model.Jenkins;
 import jenkins.security.ImpersonatingUserDetailsService;
 import jenkins.security.SecurityListener;
@@ -28,10 +27,11 @@ import org.jenkinsci.Symbol;
 import org.kohsuke.args4j.Option;
 import org.kohsuke.stapler.DataBoundConstructor;
 import org.kohsuke.stapler.StaplerRequest;
+import org.kohsuke.stapler.StaplerRequest2;
 import org.springframework.dao.DataAccessException;
 import org.springframework.web.context.WebApplicationContext;
 
-import javax.annotation.Nonnull;
+import jakarta.annotation.Nonnull;
 import java.io.IOException;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
@@ -80,14 +80,10 @@ public class MixingSecurityRealm extends HudsonPrivateSecurityRealm {
 
     @Override
     public SecurityComponents createSecurityComponents() {
-        Binding binding = new Binding();
-        binding.setVariable("authenticator", new Authenticator());
-        BeanBuilder builder = new BeanBuilder();
-        builder.parse(Jenkins.get().servletContext.getResourceAsStream("/WEB-INF/security/AbstractPasswordBasedSecurityRealm.groovy"), binding);
-        WebApplicationContext context = builder.createApplicationContext();
-        SecurityComponents securityComponents = new SecurityComponents(
-                findBean(AuthenticationManager.class, context),
-                new ImpersonatingUserDetailsService(this));
+        // In Jenkins 2.555+, use the parent's implementation directly
+        // The old Groovy BeanBuilder approach is no longer needed
+        SecurityComponents securityComponents = super.createSecurityComponents();
+        
         if (optionals == null) return securityComponents;
         Map<SecurityRealm, SecurityComponents> securityComponentsMap = new HashMap<>();
         for (SecurityRealm securityRealm : optionals) {
@@ -230,15 +226,17 @@ public class MixingSecurityRealm extends HudsonPrivateSecurityRealm {
         }
     }
 
-    @Override
-    public Details loadUserByUsername(String username) {
+    public UserDetails loadUserByUsername(String username) {
         if (this.priority) {
             try {
                 return super.loadUserByUsername(username);
             } catch (UsernameNotFoundException e) {
                 for (SecurityRealm realm : optionals) {
                     try {
-                        return fromUserDetail(realm.loadUserByUsername(username));
+                        UserDetails ud = realm.loadUserByUsername(username);
+                        @SuppressWarnings("unchecked")
+                        UserDetails result = (UserDetails) (Object) fromUserDetail(ud);
+                        return result;
                     } catch (UsernameNotFoundException ignore) {
                     }
                 }
@@ -247,7 +245,10 @@ public class MixingSecurityRealm extends HudsonPrivateSecurityRealm {
         } else {
             for (SecurityRealm realm : optionals) {
                 try {
-                    return fromUserDetail(realm.loadUserByUsername(username));
+                    UserDetails ud = realm.loadUserByUsername(username);
+                    @SuppressWarnings("unchecked")
+                    UserDetails result = (UserDetails) (Object) fromUserDetail(ud);
+                    return result;
                 } catch (UsernameNotFoundException ignore) {
                 }
             }
@@ -334,7 +335,8 @@ public class MixingSecurityRealm extends HudsonPrivateSecurityRealm {
     }
 
     private Details selfAuthenticate(String username, String password) {
-        Details u = super.loadUserByUsername(username);
+        @SuppressWarnings("unchecked")
+        Details u = (Details) (Object) super.loadUserByUsername(username);
         if (!u.isPasswordCorrect(password)) {
             String message = this.getLocalizedBadCredentialsMessage();
             throw new BadCredentialsException(message);
@@ -353,17 +355,21 @@ public class MixingSecurityRealm extends HudsonPrivateSecurityRealm {
         return "Bad credentials";
     }
 
-    @Override
-    protected Details authenticate(String username, String password) throws AuthenticationException {
+    protected UserDetails authenticate(String username, String password) throws AuthenticationException {
         if (priority) {
             if (isPrivateUser(username)) {
                 logger.fine("authenticate.isPrivateUser => " + username);
-                return selfAuthenticate(username, password);
+                @SuppressWarnings("unchecked")
+                UserDetails result = (UserDetails) (Object) selfAuthenticate(username, password);
+                return result;
             } else {
                 for (SecurityRealm realm : optionals) {
                     try {
                         logger.fine("authenticate.isOwnedBy => " + username + " -> " + realm);
-                        return fromUserDetail(realm.loadUserByUsername(username));
+                        UserDetails ud = realm.loadUserByUsername(username);
+                        @SuppressWarnings("unchecked")
+                        UserDetails result = (UserDetails) (Object) fromUserDetail(ud);
+                        return result;
                     } catch (UsernameNotFoundException ignore) {
                     }
                 }
@@ -372,12 +378,17 @@ public class MixingSecurityRealm extends HudsonPrivateSecurityRealm {
             for (SecurityRealm realm : optionals) {
                 try {
                     logger.fine("authenticate.isOwnedBy => " + username + " -> " + realm);
-                    return fromUserDetail(realm.loadUserByUsername(username));
+                    UserDetails ud = realm.loadUserByUsername(username);
+                    @SuppressWarnings("unchecked")
+                    UserDetails result = (UserDetails) (Object) fromUserDetail(ud);
+                    return result;
                 } catch (UsernameNotFoundException ignore) {
                 }
             }
             logger.fine("authenticate.isPrivateUser => " + username);
-            return selfAuthenticate(username, password);
+            @SuppressWarnings("unchecked")
+            UserDetails result = (UserDetails) (Object) selfAuthenticate(username, password);
+            return result;
         }
         throw new UsernameNotFoundException("Not found in any realm: " + username);
     }
@@ -385,7 +396,7 @@ public class MixingSecurityRealm extends HudsonPrivateSecurityRealm {
     private UserDetails doAuthenticate(String username, String password) throws AuthenticationException {
         try {
             logger.fine("doAuthenticate => " + username);
-            Details user = authenticate(username, password);
+            UserDetails user = authenticate(username, password);
             SecurityListener.fireAuthenticated(user);
             return user;
         } catch (AuthenticationException x) {
@@ -424,7 +435,7 @@ public class MixingSecurityRealm extends HudsonPrivateSecurityRealm {
         @Override
         public UserProperty newInstance(StaplerRequest req, @Nonnull JSONObject formData) throws FormException {
             if (req == null) {
-                return super.newInstance(null, formData);
+                return super.newInstance((StaplerRequest) null, formData);
             }
             User user = req.findAncestorObject(User.class);
             if (user == null) {
@@ -432,7 +443,24 @@ public class MixingSecurityRealm extends HudsonPrivateSecurityRealm {
             }
             if (user.getProperty(Details.class) != null) {
                 logger.fine("UserDescriptorImpl.newInstance.isPrivateUser => " + user.getId());
-                return descriptor.newInstance(req, formData);
+                return descriptor.newInstance((StaplerRequest) req, formData);
+            }
+            logger.fine("UserDescriptorImpl.newInstance.isOwnedByOther => " + user.getId());
+            return proxyDetail(user.getId(), user);
+        }
+
+        @Override
+        public UserProperty newInstance(StaplerRequest2 req, @Nonnull JSONObject formData) throws FormException {
+            if (req == null) {
+                return super.newInstance((StaplerRequest2) null, formData);
+            }
+            User user = req.findAncestorObject(User.class);
+            if (user == null) {
+                throw new IllegalArgumentException("No ancestor of type User in the request");
+            }
+            if (user.getProperty(Details.class) != null) {
+                logger.fine("UserDescriptorImpl.newInstance.isPrivateUser => " + user.getId());
+                return descriptor.newInstance((StaplerRequest2) req, formData);
             }
             logger.fine("UserDescriptorImpl.newInstance.isOwnedByOther => " + user.getId());
             return proxyDetail(user.getId(), user);
@@ -489,25 +517,60 @@ public class MixingSecurityRealm extends HudsonPrivateSecurityRealm {
 
         @Override
         public SecurityRealm newInstance(StaplerRequest req, JSONObject formData) throws FormException {
-            JSONArray array = formData.getJSONArray("optional");
             DescriptorExtensionList<SecurityRealm, Descriptor<SecurityRealm>> all = SecurityRealm.all();
             optionals.clear();
-            for (Object o : array) {
-                JSONObject j = (JSONObject) o;
-                boolean enabled = j.getBoolean("$enabled");
-                if (enabled) {
-                    String id = j.getString("$id");
-                    j.remove("$id");
-                    j.remove("$enabled");
-                    Descriptor<SecurityRealm> descriptor = all.findByName(id);
-                    if (descriptor != null) {
-                        SecurityRealm realm = descriptor.newInstance(req, j);
-                        if (realm != null) {
-                            optionals.add(realm);
-                        }
+            
+            logger.fine("=== MixingSecurityRealm.newInstance called ===");
+            logger.fine("Form keys: " + formData.keySet());
+            
+            // First pass: find all optional realm indices and IDs
+            Map<Integer, String> realmIds = new HashMap<>();
+            for (String key : formData.keySet()) {
+                if (key.startsWith("optionalId")) {
+                    try {
+                        int index = Integer.parseInt(key.substring("optionalId".length()));
+                        String id = (String) formData.get(key);
+                        realmIds.put(index, id);
+                        logger.fine("Found realm at index " + index + ": " + id);
+                    } catch (NumberFormatException e) {
+                        // Skip
                     }
                 }
             }
+            
+            // Second pass: for each enabled realm, extract its config and create instance
+            for (int index : realmIds.keySet()) {
+                String enabledKey = "optionalEnabled" + index;
+                if (formData.optBoolean(enabledKey, false)) {
+                    String realmId = realmIds.get(index);
+                    Descriptor<SecurityRealm> descriptor = all.findByName(realmId);
+                    logger.fine("Creating realm instance for index " + index + " (id: " + realmId + ")");
+                    
+                    if (descriptor != null) {
+                        SecurityRealm realm;
+                        if ("hudson.security.SecurityRealm$None".equals(realmId)) {
+                            // The "None" security realm is a singleton not meant to be form-bound.
+                            realm = SecurityRealm.NO_AUTHENTICATION;
+                            logger.fine("Using singleton NO_AUTHENTICATION realm");
+                        } else {
+                            // Build a clean copy of formData without the outer $class/stapler-class hints,
+                            // which would otherwise cause Stapler's bindJSON to try to instantiate the wrong type.
+                            JSONObject realmFormData = JSONObject.fromObject(formData);
+                            realmFormData.remove("$class");
+                            realmFormData.remove("stapler-class");
+                            realm = descriptor.newInstance(req, realmFormData);
+                        }
+                        if (realm != null) {
+                            optionals.add(realm);
+                            logger.fine("Created realm: " + realm.getClass().getName());
+                        }
+                    } else {
+                        logger.fine("No descriptor found for realm: " + realmId);
+                    }
+                }
+            }
+            
+            logger.fine("Saving " + optionals.size() + " optional realms");
             save();
             MixingSecurityRealm securityRealm = (MixingSecurityRealm) super.newInstance(req, formData);
             securityRealm.optionals.clear();
