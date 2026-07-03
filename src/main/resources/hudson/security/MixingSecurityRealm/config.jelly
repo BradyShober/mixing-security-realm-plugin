@@ -25,30 +25,19 @@
         <f:checkbox default="true" title="${%Current Realm Priority}"/>
     </f:entry>
     <f:entry title="${%Optional Realm}">
-        <style>
-            .mixing-realm-block { border: 1px solid #ccc; padding: 10px; margin: 5px 0; }
-            .mixing-realm-config { display: none; margin-top: 10px; padding-left: 20px; }
-            .mixing-realm-checkbox:checked ~ .mixing-realm-config { display: block; }
-        </style>
         <div>
             <j:set var="mixingDescriptor" value="${descriptor}"/>
             <j:forEach var="realmDescriptor" items="${mixingDescriptor.getSecurityRealmDescriptors()}" varStatus="loop">
                 <j:set var="instance" value="${mixingDescriptor.getInstance(realmDescriptor)}"/>
-                <div class="mixing-realm-block">
-                    <j:if test="${instance != null}">
-                        <input type="checkbox" class="mixing-realm-checkbox" name="optionalEnabled${loop.index}" value="on" checked="checked"/>
-                    </j:if>
-                    <j:if test="${instance == null}">
-                        <input type="checkbox" class="mixing-realm-checkbox" name="optionalEnabled${loop.index}" value="on"/>
-                    </j:if>
-                    <strong>${realmDescriptor.displayName}</strong>
-                    <input type="hidden" name="optionalId${loop.index}" value="${realmDescriptor.id}"/>
-                    <div class="mixing-realm-config">
-                        <j:set var="descriptor" value="${realmDescriptor}"/>
-                        <j:set var="instance" value="${instance}"/>
-                        <st:include page="${realmDescriptor.configPage}" from="${realmDescriptor}" optional="true"/>
-                    </div>
-                </div>
+                <f:optionalBlock name="optional${loop.index}" checked="${instance != null}" title="${realmDescriptor.displayName}">
+                    <input type="hidden" name="id" value="${realmDescriptor.id}"/>
+                    <f:entry title="${%Priority order}">
+                        <f:number name="order" value="${mixingDescriptor.getOrder(realmDescriptor)}" min="0"/>
+                    </f:entry>
+                    <j:set var="descriptor" value="${realmDescriptor}"/>
+                    <j:set var="instance" value="${instance}"/>
+                    <st:include page="${realmDescriptor.configPage}" from="${realmDescriptor}" optional="true"/>
+                </f:optionalBlock>
             </j:forEach>
         </div>
     </f:entry>

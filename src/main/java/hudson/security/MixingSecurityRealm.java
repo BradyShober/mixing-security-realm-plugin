@@ -26,8 +26,11 @@ import org.acegisecurity.userdetails.UsernameNotFoundException;
 import org.jenkinsci.Symbol;
 import org.kohsuke.args4j.Option;
 import org.kohsuke.stapler.DataBoundConstructor;
+import org.kohsuke.stapler.HttpResponse;
+import org.kohsuke.stapler.HttpResponses;
 import org.kohsuke.stapler.StaplerRequest;
 import org.kohsuke.stapler.StaplerRequest2;
+import org.kohsuke.stapler.StaplerResponse2;
 import org.springframework.dao.DataAccessException;
 import org.springframework.web.context.WebApplicationContext;
 
@@ -68,6 +71,105 @@ public class MixingSecurityRealm extends HudsonPrivateSecurityRealm {
     public boolean isPrivateUser(String username) {
         User u = User.getById(username, false);
         return u != null && u.getProperty(Details.class) != null;
+    }
+
+    public List<SecurityRealm> getOptionals() {
+        return optionals;
+    }
+
+    /**
+     * Exposes each mixed-in optional realm at {@code securityRealm/optional/<index>/...} so that
+     * realms with their own redirect-based login flow (e.g. OpenID Connect, SAML, OAuth style
+     * plugins that implement {@code doCommenceLogin}) continue to work correctly when they are
+     * not the top-level active {@link SecurityRealm}. This is generic: it works for any realm
+     * that follows the standard Jenkins convention of exposing extra pages under
+     * {@code CONTEXT_ROOT/securityRealm/}, without any plugin-specific knowledge.
+     */
+    public SecurityRealm getOptional(int index) {
+        if (optionals == null || index < 0 || index >= optionals.size()) {
+            return null;
+        }
+        return optionals.get(index);
+    }
+
+    /**
+     * Returns the relative URL (rooted at this realm's own {@code securityRealm/} URL space) that
+     * should be used to trigger the given optional realm's own login flow, if it has one. Realms
+     * that only support username/password (and thus participate in the normal mixed login form)
+     * leave {@link SecurityRealm#getLoginUrl()} at its default value of {@code "login"} and are
+     * skipped. Any realm overriding it (a strong, documented Jenkins-wide signal that it wants to
+     * take over the login experience, as used by SSO-style plugins) gets proxied through
+     * {@link #getOptional(int)}.
+     */
+    public String getOptionalLoginUrl(int index) {
+        SecurityRealm realm = getOptional(index);
+        if (realm == null) {
+            return null;
+        }
+        if (requiresTopLevelRealmBinding(realm)) {
+            // Some realms hard-cast Jenkins.get().getSecurityRealm() to their own class.
+            // Those cannot run safely when nested inside MixingSecurityRealm.
+            return null;
+        }
+        String loginUrl = realm.getLoginUrl();
+        if (loginUrl == null || "login".equals(loginUrl)) {
+            // Default password-based login; no separate link needed.
+            return null;
+        }
+        if (loginUrl.startsWith("/")) {
+            loginUrl = loginUrl.substring(1);
+        }
+        String prefix = "securityRealm/";
+        if (loginUrl.startsWith(prefix)) {
+            loginUrl = loginUrl.substring(prefix.length());
+        }
+        return "optional/" + index + "/" + loginUrl;
+    }
+
+    public boolean supportsOptionalFinishLogin() {
+        return findOptionalHandlerRealm("doFinishLogin") != null;
+    }
+
+    @SuppressWarnings("unused")
+    public HttpResponse doFinishLogin(final StaplerRequest2 request, final StaplerResponse2 response) {
+        SecurityRealm realm = findOptionalHandlerRealm("doFinishLogin");
+        if (realm == null) {
+            return HttpResponses.errorWithoutStack(404, "No optional realm is able to handle finishLogin");
+        }
+        try {
+            Method handler = realm.getClass().getMethod("doFinishLogin", StaplerRequest2.class, StaplerResponse2.class);
+            Object result = handler.invoke(realm, request, response);
+            if (result instanceof HttpResponse) {
+                return (HttpResponse) result;
+            }
+            return HttpResponses.errorWithoutStack(500, "Unsupported finishLogin response from optional realm");
+        } catch (NoSuchMethodException | IllegalAccessException e) {
+            throw new IllegalStateException("Unable to invoke optional realm finishLogin handler", e);
+        } catch (InvocationTargetException e) {
+            throw new RuntimeException(e.getCause());
+        }
+    }
+
+    private SecurityRealm findOptionalHandlerRealm(String handlerName) {
+        if (optionals == null) {
+            return null;
+        }
+        for (SecurityRealm realm : optionals) {
+            if (realm == null || requiresTopLevelRealmBinding(realm)) {
+                continue;
+            }
+            try {
+                realm.getClass().getMethod(handlerName, StaplerRequest2.class, StaplerResponse2.class);
+                return realm;
+            } catch (NoSuchMethodException ignore) {
+                // Not all realms expose this endpoint.
+            }
+        }
+        return null;
+    }
+
+    private boolean requiresTopLevelRealmBinding(SecurityRealm realm) {
+        return "org.jenkinsci.plugins.oic.OicSecurityRealm".equals(realm.getClass().getName());
     }
 
     public static boolean isOwnedBy(String username, UserDetailsService service) {
@@ -515,6 +617,19 @@ public class MixingSecurityRealm extends HudsonPrivateSecurityRealm {
             return null;
         }
 
+        public int getOrder(Descriptor<SecurityRealm> descriptor) {
+            if (descriptor == null) {
+                return 0;
+            }
+            for (int i = 0; i < optionals.size(); i++) {
+                SecurityRealm securityRealm = optionals.get(i);
+                if (securityRealm != null && descriptor.clazz == securityRealm.getClass()) {
+                    return i;
+                }
+            }
+            return 0;
+        }
+
         @Override
         public SecurityRealm newInstance(StaplerRequest req, JSONObject formData) throws FormException {
             DescriptorExtensionList<SecurityRealm, Descriptor<SecurityRealm>> all = SecurityRealm.all();
@@ -523,51 +638,52 @@ public class MixingSecurityRealm extends HudsonPrivateSecurityRealm {
             logger.fine("=== MixingSecurityRealm.newInstance called ===");
             logger.fine("Form keys: " + formData.keySet());
             
-            // First pass: find all optional realm indices and IDs
-            Map<Integer, String> realmIds = new HashMap<>();
+            // f:optionalBlock nests each realm's fields into its own JSON object keyed by
+            // "optionalN". When unchecked, the value is the boolean false; when checked, it's
+            // a nested JSONObject containing "id" plus that realm's own config fields, fully
+            // scoped away from any other same-named fields elsewhere on the page (e.g. Jenkins'
+            // own top-level security realm chooser, which also renders each realm's config.jelly).
+            // Each enabled realm also carries an "order" field used to control mixing priority.
+            List<Map.Entry<Integer, SecurityRealm>> ordered = new ArrayList<>();
             for (String key : formData.keySet()) {
-                if (key.startsWith("optionalId")) {
-                    try {
-                        int index = Integer.parseInt(key.substring("optionalId".length()));
-                        String id = (String) formData.get(key);
-                        realmIds.put(index, id);
-                        logger.fine("Found realm at index " + index + ": " + id);
-                    } catch (NumberFormatException e) {
-                        // Skip
-                    }
+                if (!key.startsWith("optional")) {
+                    continue;
+                }
+                Object value = formData.get(key);
+                if (!(value instanceof JSONObject)) {
+                    // Unchecked block; value is boolean false
+                    continue;
+                }
+                JSONObject realmFormData = (JSONObject) value;
+                String realmId = realmFormData.optString("id", null);
+                if (realmId == null) {
+                    continue;
+                }
+                int order = realmFormData.optInt("order", 0);
+                logger.fine("Processing enabled realm at " + key + " (id: " + realmId + ", order: " + order + ")");
+                Descriptor<SecurityRealm> descriptor = all.findByName(realmId);
+                if (descriptor == null) {
+                    logger.fine("No descriptor found for realm: " + realmId);
+                    continue;
+                }
+                SecurityRealm realm;
+                if ("hudson.security.SecurityRealm$None".equals(realmId)) {
+                    // The "None" security realm is a singleton not meant to be form-bound.
+                    realm = SecurityRealm.NO_AUTHENTICATION;
+                    logger.fine("Using singleton NO_AUTHENTICATION realm");
+                } else {
+                    realm = descriptor.newInstance(req, realmFormData);
+                }
+                if (realm != null) {
+                    ordered.add(new AbstractMap.SimpleEntry<>(order, realm));
+                    logger.fine("Created realm: " + realm.getClass().getName());
                 }
             }
             
-            // Second pass: for each enabled realm, extract its config and create instance
-            for (int index : realmIds.keySet()) {
-                String enabledKey = "optionalEnabled" + index;
-                if (formData.optBoolean(enabledKey, false)) {
-                    String realmId = realmIds.get(index);
-                    Descriptor<SecurityRealm> descriptor = all.findByName(realmId);
-                    logger.fine("Creating realm instance for index " + index + " (id: " + realmId + ")");
-                    
-                    if (descriptor != null) {
-                        SecurityRealm realm;
-                        if ("hudson.security.SecurityRealm$None".equals(realmId)) {
-                            // The "None" security realm is a singleton not meant to be form-bound.
-                            realm = SecurityRealm.NO_AUTHENTICATION;
-                            logger.fine("Using singleton NO_AUTHENTICATION realm");
-                        } else {
-                            // Build a clean copy of formData without the outer $class/stapler-class hints,
-                            // which would otherwise cause Stapler's bindJSON to try to instantiate the wrong type.
-                            JSONObject realmFormData = JSONObject.fromObject(formData);
-                            realmFormData.remove("$class");
-                            realmFormData.remove("stapler-class");
-                            realm = descriptor.newInstance(req, realmFormData);
-                        }
-                        if (realm != null) {
-                            optionals.add(realm);
-                            logger.fine("Created realm: " + realm.getClass().getName());
-                        }
-                    } else {
-                        logger.fine("No descriptor found for realm: " + realmId);
-                    }
-                }
+            // Sort by user-specified priority order (ascending) so the first realm listed is tried first.
+            ordered.sort(Comparator.comparingInt(Map.Entry::getKey));
+            for (Map.Entry<Integer, SecurityRealm> entry : ordered) {
+                optionals.add(entry.getValue());
             }
             
             logger.fine("Saving " + optionals.size() + " optional realms");
