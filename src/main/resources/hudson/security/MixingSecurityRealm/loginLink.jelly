@@ -3,35 +3,9 @@
     <a class="jenkins-button"
        data-type="header-action"
        data-testid="login"
-       href="${rootURL}/${app.securityRealm.loginUrl}?from=${app.securityRealm.from}"
+       href="${rootURL}/securityRealm/mixedLogin?from=${app.securityRealm.from}"
        style="aspect-ratio: unset; padding: 0.5rem 1rem"
        tooltip="${%signInTooltip}">
         Sign In
     </a>
-    <j:set var="hasSsoOption" value="${false}"/>
-    <j:forEach var="optional" items="${app.securityRealm.optionals}" varStatus="loop">
-        <j:if test="${app.securityRealm.getOptionalLoginUrl(loop.index) != null}">
-            <j:set var="hasSsoOption" value="${true}"/>
-        </j:if>
-    </j:forEach>
-    <j:if test="${hasSsoOption}">
-        <details style="display: inline-block; margin-left: 0.5rem">
-            <summary class="jenkins-button"
-                     data-type="header-action"
-                     style="list-style: none; cursor: pointer; aspect-ratio: unset; padding: 0.5rem 1rem">
-                Sign in with SSO
-            </summary>
-            <div style="position: absolute; z-index: 1000; margin-top: 0.25rem; min-width: 14rem; background: var(--background, #fff); border: 1px solid var(--border-color, #d0d7de); border-radius: 6px; box-shadow: 0 8px 24px rgba(0,0,0,0.12); padding: 0.25rem 0;">
-                <j:forEach var="optional" items="${app.securityRealm.optionals}" varStatus="loop">
-                    <j:set var="ssoUrl" value="${app.securityRealm.getOptionalLoginUrl(loop.index)}"/>
-                    <j:if test="${ssoUrl != null}">
-                        <a href="${rootURL}/securityRealm/${ssoUrl}?from=${app.securityRealm.from}"
-                           style="display: block; padding: 0.5rem 0.75rem; text-decoration: none;">
-                            Sign in with ${optional.descriptor.displayName}
-                        </a>
-                    </j:if>
-                </j:forEach>
-            </div>
-        </details>
-    </j:if>
 </j:jelly>

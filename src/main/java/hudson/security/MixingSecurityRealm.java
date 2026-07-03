@@ -32,9 +32,13 @@ import org.kohsuke.stapler.StaplerRequest;
 import org.kohsuke.stapler.StaplerRequest2;
 import org.kohsuke.stapler.StaplerResponse2;
 import org.springframework.dao.DataAccessException;
+import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.web.context.WebApplicationContext;
 
 import jakarta.annotation.Nonnull;
+import jakarta.servlet.ServletException;
+import jakarta.servlet.http.Cookie;
+import jakarta.servlet.http.HttpSession;
 import java.io.IOException;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
@@ -126,8 +130,64 @@ public class MixingSecurityRealm extends HudsonPrivateSecurityRealm {
         return "optional/" + index + "/" + loginUrl;
     }
 
+    public String sanitizeFrom(String from, String contextPath) {
+        String fallback = (contextPath == null || contextPath.isEmpty()) ? "/" : (contextPath + "/");
+        if (from == null) {
+            return fallback;
+        }
+        String value = from.trim();
+        if (value.isEmpty()) {
+            return fallback;
+        }
+        String lower = value.toLowerCase(Locale.ROOT);
+        if (lower.contains("j_spring_security_check")
+                || lower.contains("j_security_check")
+                || lower.contains("/securityrealm/login")
+                || lower.contains("/securityrealm/mixedlogin")) {
+            return fallback;
+        }
+        return value;
+    }
+
     public boolean supportsOptionalFinishLogin() {
         return findOptionalHandlerRealm("doFinishLogin") != null;
+    }
+
+    @Override
+    public void doLogout(StaplerRequest2 req, StaplerResponse2 rsp) throws IOException, ServletException {
+        HttpSession session = req.getSession(false);
+        if (session != null) {
+            session.invalidate();
+        }
+        org.springframework.security.core.Authentication auth = SecurityContextHolder.getContext().getAuthentication();
+        SecurityContextHolder.clearContext();
+
+        String contextPath = !req.getContextPath().isEmpty() ? req.getContextPath() : "/";
+        expireCookie(req, rsp, contextPath, "remember-me");
+        expireCookie(req, rsp, contextPath, "ACEGI_SECURITY_HASHED_REMEMBER_ME_COOKIE");
+        expireCookie(req, rsp, contextPath, "ACEGI_SECURITY_HASHED_REMEMBER_ME_COOKIE_KEY");
+        expireCookie(req, rsp, contextPath, "JSESSIONID");
+
+        Cookie[] cookies = req.getCookies();
+        if (cookies != null) {
+            for (Cookie cookie : cookies) {
+                String name = cookie.getName();
+                if (name != null && name.startsWith("JSESSIONID.")) {
+                    expireCookie(req, rsp, contextPath, name);
+                }
+            }
+        }
+
+        rsp.sendRedirect2(getPostLogOutUrl2(req, auth));
+    }
+
+    private void expireCookie(StaplerRequest2 req, StaplerResponse2 rsp, String path, String name) {
+        Cookie cookie = new Cookie(name, "");
+        cookie.setMaxAge(0);
+        cookie.setSecure(req.isSecure());
+        cookie.setHttpOnly(true);
+        cookie.setPath(path);
+        rsp.addCookie(cookie);
     }
 
     @SuppressWarnings("unused")
@@ -617,19 +677,6 @@ public class MixingSecurityRealm extends HudsonPrivateSecurityRealm {
             return null;
         }
 
-        public int getOrder(Descriptor<SecurityRealm> descriptor) {
-            if (descriptor == null) {
-                return 0;
-            }
-            for (int i = 0; i < optionals.size(); i++) {
-                SecurityRealm securityRealm = optionals.get(i);
-                if (securityRealm != null && descriptor.clazz == securityRealm.getClass()) {
-                    return i;
-                }
-            }
-            return 0;
-        }
-
         @Override
         public SecurityRealm newInstance(StaplerRequest req, JSONObject formData) throws FormException {
             DescriptorExtensionList<SecurityRealm, Descriptor<SecurityRealm>> all = SecurityRealm.all();
@@ -638,52 +685,78 @@ public class MixingSecurityRealm extends HudsonPrivateSecurityRealm {
             logger.fine("=== MixingSecurityRealm.newInstance called ===");
             logger.fine("Form keys: " + formData.keySet());
             
-            // f:optionalBlock nests each realm's fields into its own JSON object keyed by
-            // "optionalN". When unchecked, the value is the boolean false; when checked, it's
-            // a nested JSONObject containing "id" plus that realm's own config fields, fully
-            // scoped away from any other same-named fields elsewhere on the page (e.g. Jenkins'
-            // own top-level security realm chooser, which also renders each realm's config.jelly).
-            // Each enabled realm also carries an "order" field used to control mixing priority.
-            List<Map.Entry<Integer, SecurityRealm>> ordered = new ArrayList<>();
-            for (String key : formData.keySet()) {
-                if (!key.startsWith("optional")) {
-                    continue;
+            // New UI path: repeatableHeteroProperty field="optionals" submits an ordered JSON array.
+            Object optionalsValue = formData.get("optionals");
+            if (optionalsValue instanceof JSONArray) {
+                JSONArray optionalsArray = (JSONArray) optionalsValue;
+                for (int i = 0; i < optionalsArray.size(); i++) {
+                    Object entry = optionalsArray.get(i);
+                    if (!(entry instanceof JSONObject)) {
+                        continue;
+                    }
+                    JSONObject realmFormData = (JSONObject) entry;
+                    String realmId = realmFormData.optString("$class", realmFormData.optString("stapler-class", null));
+                    logger.fine("Processing enabled realm at optionals[" + i + "] (id: " + realmId + ")");
+                    if (realmId == null) {
+                        continue;
+                    }
+                    Descriptor<SecurityRealm> descriptor = all.findByName(realmId);
+                    if (descriptor == null) {
+                        logger.fine("No descriptor found for realm: " + realmId);
+                        continue;
+                    }
+                    SecurityRealm realm;
+                    if ("hudson.security.SecurityRealm$None".equals(realmId)) {
+                        realm = SecurityRealm.NO_AUTHENTICATION;
+                        logger.fine("Using singleton NO_AUTHENTICATION realm");
+                    } else {
+                        realm = descriptor.newInstance(req, realmFormData);
+                    }
+                    if (realm != null) {
+                        optionals.add(realm);
+                        logger.fine("Created realm: " + realm.getClass().getName());
+                    }
                 }
-                Object value = formData.get(key);
-                if (!(value instanceof JSONObject)) {
-                    // Unchecked block; value is boolean false
-                    continue;
+            } else {
+                // Backward compatibility for the previous optionalBlock-based UI payload.
+                List<Map.Entry<Integer, SecurityRealm>> ordered = new ArrayList<>();
+                for (String key : formData.keySet()) {
+                    if (!key.startsWith("optional")) {
+                        continue;
+                    }
+                    Object value = formData.get(key);
+                    if (!(value instanceof JSONObject)) {
+                        // Unchecked block; value is boolean false
+                        continue;
+                    }
+                    JSONObject realmFormData = (JSONObject) value;
+                    String realmId = realmFormData.optString("id", null);
+                    if (realmId == null) {
+                        continue;
+                    }
+                    int order = realmFormData.optInt("order", 0);
+                    logger.fine("Processing enabled realm at " + key + " (id: " + realmId + ", order: " + order + ")");
+                    Descriptor<SecurityRealm> descriptor = all.findByName(realmId);
+                    if (descriptor == null) {
+                        logger.fine("No descriptor found for realm: " + realmId);
+                        continue;
+                    }
+                    SecurityRealm realm;
+                    if ("hudson.security.SecurityRealm$None".equals(realmId)) {
+                        realm = SecurityRealm.NO_AUTHENTICATION;
+                        logger.fine("Using singleton NO_AUTHENTICATION realm");
+                    } else {
+                        realm = descriptor.newInstance(req, realmFormData);
+                    }
+                    if (realm != null) {
+                        ordered.add(new AbstractMap.SimpleEntry<>(order, realm));
+                        logger.fine("Created realm: " + realm.getClass().getName());
+                    }
                 }
-                JSONObject realmFormData = (JSONObject) value;
-                String realmId = realmFormData.optString("id", null);
-                if (realmId == null) {
-                    continue;
+                ordered.sort(Comparator.comparingInt(Map.Entry::getKey));
+                for (Map.Entry<Integer, SecurityRealm> entry : ordered) {
+                    optionals.add(entry.getValue());
                 }
-                int order = realmFormData.optInt("order", 0);
-                logger.fine("Processing enabled realm at " + key + " (id: " + realmId + ", order: " + order + ")");
-                Descriptor<SecurityRealm> descriptor = all.findByName(realmId);
-                if (descriptor == null) {
-                    logger.fine("No descriptor found for realm: " + realmId);
-                    continue;
-                }
-                SecurityRealm realm;
-                if ("hudson.security.SecurityRealm$None".equals(realmId)) {
-                    // The "None" security realm is a singleton not meant to be form-bound.
-                    realm = SecurityRealm.NO_AUTHENTICATION;
-                    logger.fine("Using singleton NO_AUTHENTICATION realm");
-                } else {
-                    realm = descriptor.newInstance(req, realmFormData);
-                }
-                if (realm != null) {
-                    ordered.add(new AbstractMap.SimpleEntry<>(order, realm));
-                    logger.fine("Created realm: " + realm.getClass().getName());
-                }
-            }
-            
-            // Sort by user-specified priority order (ascending) so the first realm listed is tried first.
-            ordered.sort(Comparator.comparingInt(Map.Entry::getKey));
-            for (Map.Entry<Integer, SecurityRealm> entry : ordered) {
-                optionals.add(entry.getValue());
             }
             
             logger.fine("Saving " + optionals.size() + " optional realms");
@@ -733,6 +806,10 @@ public class MixingSecurityRealm extends HudsonPrivateSecurityRealm {
                 return s1 - s2;
             });
             return list;
+        }
+
+        public List<Descriptor<SecurityRealm>> getOptionalsDescriptors() {
+            return getSecurityRealmDescriptors();
         }
     }
 

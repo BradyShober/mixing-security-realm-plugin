@@ -24,21 +24,10 @@
     <f:entry field="priority">
         <f:checkbox default="true" title="${%Current Realm Priority}"/>
     </f:entry>
-    <f:entry title="${%Optional Realm}">
-        <div>
-            <j:set var="mixingDescriptor" value="${descriptor}"/>
-            <j:forEach var="realmDescriptor" items="${mixingDescriptor.getSecurityRealmDescriptors()}" varStatus="loop">
-                <j:set var="instance" value="${mixingDescriptor.getInstance(realmDescriptor)}"/>
-                <f:optionalBlock name="optional${loop.index}" checked="${instance != null}" title="${realmDescriptor.displayName}">
-                    <input type="hidden" name="id" value="${realmDescriptor.id}"/>
-                    <f:entry title="${%Priority order}">
-                        <f:number name="order" value="${mixingDescriptor.getOrder(realmDescriptor)}" min="0"/>
-                    </f:entry>
-                    <j:set var="descriptor" value="${realmDescriptor}"/>
-                    <j:set var="instance" value="${instance}"/>
-                    <st:include page="${realmDescriptor.configPage}" from="${realmDescriptor}" optional="true"/>
-                </f:optionalBlock>
-            </j:forEach>
-        </div>
+    <f:entry title="${%Optional Realms}">
+        <f:repeatableHeteroProperty field="optionals"
+                                    addCaption="${%Add optional realm}"
+                                    oneEach="true"
+                                    hasHeader="true"/>
     </f:entry>
 </j:jelly>
