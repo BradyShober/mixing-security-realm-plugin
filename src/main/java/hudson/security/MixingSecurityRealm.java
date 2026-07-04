@@ -26,6 +26,7 @@ import org.acegisecurity.userdetails.UsernameNotFoundException;
 import org.jenkinsci.Symbol;
 import org.kohsuke.args4j.Option;
 import org.kohsuke.stapler.DataBoundConstructor;
+import org.kohsuke.stapler.DataBoundSetter;
 import org.kohsuke.stapler.HttpResponse;
 import org.kohsuke.stapler.HttpResponses;
 import org.kohsuke.stapler.Stapler;
@@ -88,6 +89,15 @@ public class MixingSecurityRealm extends HudsonPrivateSecurityRealm {
 
     public List<SecurityRealm> getOptionals() {
         return optionals;
+    }
+
+    @DataBoundSetter
+    public void setOptionals(List<SecurityRealm> optionals) {
+        if (optionals == null) {
+            this.optionals = new ArrayList<>();
+            return;
+        }
+        this.optionals = new ArrayList<>(optionals);
     }
 
     /**
@@ -1056,8 +1066,7 @@ public class MixingSecurityRealm extends HudsonPrivateSecurityRealm {
             logger.fine("Saving " + optionals.size() + " optional realms");
             save();
             MixingSecurityRealm securityRealm = (MixingSecurityRealm) super.newInstance(req, formData);
-            securityRealm.optionals.clear();
-            securityRealm.optionals.addAll(optionals);
+            securityRealm.setOptionals(optionals);
             return securityRealm;
         }
 

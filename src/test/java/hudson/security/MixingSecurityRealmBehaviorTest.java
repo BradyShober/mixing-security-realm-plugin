@@ -10,7 +10,6 @@ import org.jvnet.hudson.test.JenkinsRule;
 import org.kohsuke.stapler.StaplerRequest2;
 import org.kohsuke.stapler.StaplerResponse2;
 
-import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
@@ -139,11 +138,8 @@ public class MixingSecurityRealmBehaviorTest {
         assertTrue(saml instanceof SamlFinishRealm);
     }
 
-    @SuppressWarnings("unchecked")
     private static void setOptionals(MixingSecurityRealm realm, List<SecurityRealm> optionals) throws Exception {
-        Field field = MixingSecurityRealm.class.getDeclaredField("optionals");
-        field.setAccessible(true);
-        field.set(realm, optionals);
+        realm.setOptionals(optionals);
     }
 
     private static final class TestSecurityRealm extends SecurityRealm {
