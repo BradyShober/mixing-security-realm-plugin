@@ -73,9 +73,10 @@
                 <j:forEach var="optional" items="${it.optionals}" varStatus="loop">
                   <j:set var="ssoUrl" value="${it.getOptionalLoginUrl(loop.index)}" />
                   <j:if test="${ssoUrl != null}">
+                    <j:set var="ssoSeparator" value="${ssoUrl.contains('?') ? '&amp;' : '?'}" />
                     <div style="margin-bottom: 0.5rem">
                       <a class="jenkins-button"
-                         href="${rootURL}/securityRealm/${ssoUrl}?from=${from}"
+                         href="${rootURL}/securityRealm/${ssoUrl}${ssoSeparator}from=${from}"
                          style="aspect-ratio: unset; padding: 0.5rem 1rem">
                         Sign in with ${optional.descriptor.displayName}
                       </a>

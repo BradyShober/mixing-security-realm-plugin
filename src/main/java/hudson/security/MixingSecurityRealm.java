@@ -28,9 +28,12 @@ import org.kohsuke.args4j.Option;
 import org.kohsuke.stapler.DataBoundConstructor;
 import org.kohsuke.stapler.HttpResponse;
 import org.kohsuke.stapler.HttpResponses;
+import org.kohsuke.stapler.Stapler;
 import org.kohsuke.stapler.StaplerRequest;
 import org.kohsuke.stapler.StaplerRequest2;
+import org.kohsuke.stapler.StaplerResponse;
 import org.kohsuke.stapler.StaplerResponse2;
+import org.kohsuke.stapler.QueryParameter;
 import org.springframework.dao.DataAccessException;
 import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.web.context.WebApplicationContext;
@@ -51,6 +54,12 @@ import java.util.logging.Logger;
 public class MixingSecurityRealm extends HudsonPrivateSecurityRealm {
 
     private static final Logger logger = Logger.getLogger(MixingSecurityRealm.class.getName());
+    private static final String OPTIONAL_REALM_INDEX_SESSION_KEY =
+            MixingSecurityRealm.class.getName() + ".activeOptionalRealmIndex";
+    private static final Object OPTIONAL_REALM_BINDING_LOCK = new Object();
+    private static final boolean ENABLE_OPTIONAL_REALM_BINDING_BRIDGE = Boolean.parseBoolean(
+            System.getProperty(MixingSecurityRealm.class.getName() + ".enableOptionalRealmBindingBridge", "true"));
+    private static final Field JENKINS_SECURITY_REALM_FIELD = initJenkinsSecurityRealmField();
 
     private List<SecurityRealm> optionals = new ArrayList<>();
     private boolean priority;
@@ -110,15 +119,13 @@ public class MixingSecurityRealm extends HudsonPrivateSecurityRealm {
         if (realm == null) {
             return null;
         }
-        if (requiresTopLevelRealmBinding(realm)) {
-            // Some realms hard-cast Jenkins.get().getSecurityRealm() to their own class.
-            // Those cannot run safely when nested inside MixingSecurityRealm.
-            return null;
-        }
         String loginUrl = realm.getLoginUrl();
         if (loginUrl == null || "login".equals(loginUrl)) {
             // Default password-based login; no separate link needed.
             return null;
+        }
+        if (ENABLE_OPTIONAL_REALM_BINDING_BRIDGE && loginUrl.endsWith("commenceLogin")) {
+            return "optionalCommenceLogin?index=" + index;
         }
         if (loginUrl.startsWith("/")) {
             loginUrl = loginUrl.substring(1);
@@ -191,20 +198,189 @@ public class MixingSecurityRealm extends HudsonPrivateSecurityRealm {
     }
 
     @SuppressWarnings("unused")
-    public HttpResponse doFinishLogin(final StaplerRequest2 request, final StaplerResponse2 response) {
-        SecurityRealm realm = findOptionalHandlerRealm("doFinishLogin");
+    public Object doOptionalCommenceLogin(
+            final StaplerRequest2 request,
+            final StaplerResponse2 response,
+            @QueryParameter("index") int index) {
+        SecurityRealm realm = getOptional(index);
         if (realm == null) {
+            return HttpResponses.errorWithoutStack(404, "Optional realm index out of range: " + index);
+        }
+        request.getSession(true).setAttribute(OPTIONAL_REALM_INDEX_SESSION_KEY, index);
+        return invokeOptionalHandler(realm, "doCommenceLogin", request, response);
+    }
+
+    @SuppressWarnings("unused")
+    public Object doFinishLogin(final StaplerRequest2 request, final StaplerResponse2 response) {
+        SecurityRealm preferredRealm = null;
+        HttpSession session = request.getSession(false);
+        if (session != null) {
+            Object value = session.getAttribute(OPTIONAL_REALM_INDEX_SESSION_KEY);
+            if (value instanceof Integer) {
+                preferredRealm = getOptional((Integer) value);
+            } else if (value instanceof String) {
+                try {
+                    preferredRealm = getOptional(Integer.parseInt((String) value));
+                } catch (NumberFormatException ignore) {
+                    // Fall back to full scan below.
+                }
+            }
+            session.removeAttribute(OPTIONAL_REALM_INDEX_SESSION_KEY);
+        }
+        List<SecurityRealm> handlerRealms = getOptionalHandlerRealms("doFinishLogin");
+        RuntimeException callbackFailure = null;
+        if (preferredRealm != null && hasOptionalHandler(preferredRealm, "doFinishLogin")) {
+            try {
+                return invokeOptionalHandler(preferredRealm, "doFinishLogin", request, response);
+            } catch (RuntimeException ex) {
+                logger.fine("Preferred optional realm finishLogin handler failed: " + ex.getMessage());
+                callbackFailure = ex;
+            }
+        }
+
+        String flow = inferFinishLoginFlow(request);
+        SecurityRealm flowRealm = findOptionalFinishLoginRealmByFlow(flow);
+        if (flowRealm != null && flowRealm != preferredRealm) {
+            try {
+                return invokeOptionalHandler(flowRealm, "doFinishLogin", request, response);
+            } catch (RuntimeException ex) {
+                logger.fine("Flow-matched optional realm finishLogin handler failed for " + flowRealm + ": " + ex.getMessage());
+                if (callbackFailure == null) {
+                    callbackFailure = ex;
+                }
+            }
+        }
+        if ("oidc".equals(flow)) {
+            for (SecurityRealm realm : handlerRealms) {
+                if (realm == null || realm == preferredRealm || realm == flowRealm || isLikelySamlRealm(realm)) {
+                    continue;
+                }
+                try {
+                    return invokeOptionalHandler(realm, "doFinishLogin", request, response);
+                } catch (RuntimeException ex) {
+                    logger.fine("OIDC fallback optional realm finishLogin handler failed for " + realm + ": " + ex.getMessage());
+                    if (callbackFailure == null) {
+                        callbackFailure = ex;
+                    }
+                }
+            }
+        }
+
+        if (handlerRealms.isEmpty()) {
             return HttpResponses.errorWithoutStack(404, "No optional realm is able to handle finishLogin");
         }
+        if (handlerRealms.size() == 1) {
+            return invokeOptionalHandler(handlerRealms.get(0), "doFinishLogin", request, response);
+        }
+        if (flow != null) {
+            if (callbackFailure != null) {
+                throw callbackFailure;
+            }
+            return HttpResponses.errorWithoutStack(400, "No optional realm matches finishLogin callback flow: " + flow);
+        }
+
+        if (preferredRealm != null) {
+            return HttpResponses.errorWithoutStack(400, "Optional realm finishLogin callback did not match preferred realm");
+        }
+
+        return HttpResponses.errorWithoutStack(400, "Ambiguous optional finishLogin callback");
+    }
+
+    private List<SecurityRealm> getOptionalHandlerRealms(String handlerName) {
+        List<SecurityRealm> realms = new ArrayList<>();
+        if (optionals == null) {
+            return realms;
+        }
+        for (SecurityRealm realm : optionals) {
+            if (realm != null && hasOptionalHandler(realm, handlerName)) {
+                realms.add(realm);
+            }
+        }
+        return realms;
+    }
+
+    private String inferFinishLoginFlow(StaplerRequest2 request) {
+        if (request == null) {
+            return null;
+        }
+        return inferFinishLoginFlowFromParameterNames(request.getParameterMap().keySet());
+    }
+
+    private static String inferFinishLoginFlowFromParameterNames(Set<String> parameterNames) {
+        if (parameterNames == null || parameterNames.isEmpty()) {
+            return null;
+        }
+        if (parameterNames.contains("SAMLResponse")
+                || parameterNames.contains("SAMLRequest")
+                || parameterNames.contains("RelayState")) {
+            return "saml";
+        }
+        if (parameterNames.contains("code")
+                || parameterNames.contains("id_token")
+                || parameterNames.contains("state")
+                || parameterNames.contains("error")
+                || parameterNames.contains("error_description")) {
+            return "oidc";
+        }
+        return null;
+    }
+
+    private SecurityRealm findOptionalFinishLoginRealmByFlow(String flow) {
+        if (flow == null || optionals == null) {
+            return null;
+        }
+        List<SecurityRealm> oidcFallbackCandidates = new ArrayList<>();
+        for (SecurityRealm realm : optionals) {
+            if (realm == null || !hasOptionalHandler(realm, "doFinishLogin")) {
+                continue;
+            }
+            if ("oidc".equals(flow)) {
+                if (isLikelyOidcRealm(realm)) {
+                    return realm;
+                }
+                if (!isLikelySamlRealm(realm)) {
+                    oidcFallbackCandidates.add(realm);
+                }
+            }
+            if ("saml".equals(flow) && isLikelySamlRealm(realm)) {
+                return realm;
+            }
+        }
+        if ("oidc".equals(flow) && oidcFallbackCandidates.size() == 1) {
+            return oidcFallbackCandidates.get(0);
+        }
+        return null;
+    }
+
+    private boolean isLikelyOidcRealm(SecurityRealm realm) {
+        String className = realm.getClass().getName().toLowerCase(Locale.ROOT);
+        return className.contains(".oic.")
+                || className.contains("oidc")
+                || className.contains("openid")
+                || className.contains("oauth");
+    }
+
+    private boolean isLikelySamlRealm(SecurityRealm realm) {
+        String className = realm.getClass().getName().toLowerCase(Locale.ROOT);
+        return className.contains("saml");
+    }
+
+    private Object invokeOptionalHandler(
+            final SecurityRealm realm,
+            final String handlerName,
+            final StaplerRequest2 request,
+            final StaplerResponse2 response) {
         try {
-            Method handler = realm.getClass().getMethod("doFinishLogin", StaplerRequest2.class, StaplerResponse2.class);
-            Object result = handler.invoke(realm, request, response);
+            OptionalHandlerInvocation invocation = buildOptionalHandlerInvocation(realm, handlerName, request, response);
+            Object result = withTemporarilyBoundRealm(realm, () -> invocation.method.invoke(realm, invocation.arguments));
             if (result instanceof HttpResponse) {
                 return (HttpResponse) result;
             }
-            return HttpResponses.errorWithoutStack(500, "Unsupported finishLogin response from optional realm");
-        } catch (NoSuchMethodException | IllegalAccessException e) {
-            throw new IllegalStateException("Unable to invoke optional realm finishLogin handler", e);
+            return result;
+        } catch (IllegalAccessException e) {
+            throw new IllegalStateException("Unable to invoke optional realm " + handlerName + " handler", e);
+        } catch (NoSuchMethodException e) {
+            throw new IllegalStateException("Unable to resolve optional realm " + handlerName + " handler", e);
         } catch (InvocationTargetException e) {
             throw new RuntimeException(e.getCause());
         }
@@ -215,21 +391,139 @@ public class MixingSecurityRealm extends HudsonPrivateSecurityRealm {
             return null;
         }
         for (SecurityRealm realm : optionals) {
-            if (realm == null || requiresTopLevelRealmBinding(realm)) {
+            if (realm == null) {
                 continue;
             }
-            try {
-                realm.getClass().getMethod(handlerName, StaplerRequest2.class, StaplerResponse2.class);
+            if (hasOptionalHandler(realm, handlerName)) {
                 return realm;
-            } catch (NoSuchMethodException ignore) {
-                // Not all realms expose this endpoint.
             }
         }
         return null;
     }
 
+    private boolean hasOptionalHandler(SecurityRealm realm, String handlerName) {
+        if (hasMethod(realm, handlerName, StaplerRequest2.class, StaplerResponse2.class)
+                || hasMethod(realm, handlerName, StaplerRequest.class, StaplerResponse.class)
+                || hasMethod(realm, handlerName)) {
+            return true;
+        }
+        if ("doCommenceLogin".equals(handlerName)) {
+            return hasMethod(realm, handlerName, String.class, String.class)
+                    || hasMethod(realm, handlerName, String.class);
+        }
+        return false;
+    }
+
+    private boolean hasMethod(SecurityRealm realm, String handlerName, Class<?>... parameterTypes) {
+        try {
+            realm.getClass().getMethod(handlerName, parameterTypes);
+            return true;
+        } catch (NoSuchMethodException e) {
+            return false;
+        }
+    }
+
+    private OptionalHandlerInvocation buildOptionalHandlerInvocation(
+            SecurityRealm realm,
+            String handlerName,
+            StaplerRequest2 request,
+            StaplerResponse2 response) throws NoSuchMethodException {
+        Method method = tryGetMethod(realm, handlerName, StaplerRequest2.class, StaplerResponse2.class);
+        if (method != null) {
+            return new OptionalHandlerInvocation(method, new Object[] {request, response});
+        }
+
+        method = tryGetMethod(realm, handlerName, StaplerRequest.class, StaplerResponse.class);
+        if (method != null) {
+            StaplerRequest currentRequest = Stapler.getCurrentRequest();
+            StaplerResponse currentResponse = Stapler.getCurrentResponse();
+            return new OptionalHandlerInvocation(method, new Object[] {currentRequest, currentResponse});
+        }
+
+        if ("doCommenceLogin".equals(handlerName)) {
+            method = tryGetMethod(realm, handlerName, String.class, String.class);
+            if (method != null) {
+                return new OptionalHandlerInvocation(method, new Object[] {
+                        request.getParameter("from"),
+                        request.getHeader("Referer")
+                });
+            }
+            method = tryGetMethod(realm, handlerName, String.class);
+            if (method != null) {
+                return new OptionalHandlerInvocation(method, new Object[] {request.getParameter("from")});
+            }
+        }
+
+        method = tryGetMethod(realm, handlerName);
+        if (method != null) {
+            return new OptionalHandlerInvocation(method, new Object[0]);
+        }
+
+        throw new NoSuchMethodException(realm.getClass().getName() + "." + handlerName);
+    }
+
+    private Method tryGetMethod(SecurityRealm realm, String handlerName, Class<?>... parameterTypes) {
+        try {
+            return realm.getClass().getMethod(handlerName, parameterTypes);
+        } catch (NoSuchMethodException e) {
+            return null;
+        }
+    }
+
+    private static final class OptionalHandlerInvocation {
+        private final Method method;
+        private final Object[] arguments;
+
+        private OptionalHandlerInvocation(Method method, Object[] arguments) {
+            this.method = method;
+            this.arguments = arguments;
+        }
+    }
+
     private boolean requiresTopLevelRealmBinding(SecurityRealm realm) {
-        return "org.jenkinsci.plugins.oic.OicSecurityRealm".equals(realm.getClass().getName());
+        String className = realm.getClass().getName();
+        return "org.jenkinsci.plugins.oic.OicSecurityRealm".equals(className)
+                || "hudson.security.LDAPSecurityRealm".equals(className)
+                || "hudson.plugins.active_directory.ActiveDirectorySecurityRealm".equals(className);
+    }
+
+    private interface RealmInvocation<T> {
+        T invoke() throws InvocationTargetException, IllegalAccessException;
+    }
+
+    private <T> T withTemporarilyBoundRealm(SecurityRealm realm, RealmInvocation<T> invocation)
+            throws InvocationTargetException, IllegalAccessException {
+        if (!ENABLE_OPTIONAL_REALM_BINDING_BRIDGE || realm == null || !requiresTopLevelRealmBinding(realm)) {
+            return invocation.invoke();
+        }
+        Jenkins jenkins = Jenkins.get();
+        synchronized (OPTIONAL_REALM_BINDING_LOCK) {
+            SecurityRealm originalRealm = jenkins.getSecurityRealm();
+            setJenkinsSecurityRealm(jenkins, realm);
+            try {
+                return invocation.invoke();
+            } finally {
+                setJenkinsSecurityRealm(jenkins, originalRealm);
+            }
+        }
+    }
+
+    private static Field initJenkinsSecurityRealmField() {
+        try {
+            Field field = Jenkins.class.getDeclaredField("securityRealm");
+            field.setAccessible(true);
+            return field;
+        } catch (NoSuchFieldException e) {
+            throw new IllegalStateException("Unable to locate Jenkins.securityRealm field", e);
+        }
+    }
+
+    private static void setJenkinsSecurityRealm(Jenkins jenkins, SecurityRealm realm) {
+        try {
+            JENKINS_SECURITY_REALM_FIELD.set(jenkins, realm);
+        } catch (IllegalAccessException e) {
+            throw new IllegalStateException("Unable to bind temporary Jenkins security realm", e);
+        }
     }
 
     public static boolean isOwnedBy(String username, UserDetailsService service) {
